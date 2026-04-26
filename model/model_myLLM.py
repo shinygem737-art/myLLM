@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN     # 调用Hugging Face中的激活函数，如relu、gelu等
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 
 class MyLLMConfig(PretrainedConfig):
@@ -279,3 +280,4 @@ class MyLLMForCausalLM(PreTrainedModel, GenerationMixin):
             # x.view(-1, x.size(-1)): (bsz * (seq_len - 1), vocab_size)
             # ignore_index 指定一个被忽略的标签值（不参与损失计算）
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)

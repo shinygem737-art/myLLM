@@ -4,6 +4,7 @@ import os
 import sys
 import warnings
 
+__package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
@@ -134,6 +135,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
+
     # ========== 1. 初始化环境和随机种子 ==========
     """
     - local_rank: 当前进程在本机上的GPU编号
@@ -254,40 +256,10 @@ if __name__ == "__main__":
 
         # SkipBatchSampler 是一个自定义采样器，它会基于原始采样器（或索引列表）生成 batch，但会抛弃前 skip 个 batch（即跳过已训练过的数据）
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
-
-
-
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
-
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
-            )
-            train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
-        else:  # 默认从头开始
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
             train_epoch(epoch, loader, len(loader), 0, wandb)

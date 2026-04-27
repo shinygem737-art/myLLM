@@ -1,3 +1,15 @@
 test.ipynb
-__pycache__/
+dataset/__pycache__/
+model/__pycache__/
+trainer/__pycache__/
 dataset/*.jsonl
+out/
+mytest/
+
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+.idea/
+.vscode/

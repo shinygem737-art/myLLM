@@ -4,7 +4,11 @@ import json
 import os
 import random
 from datasets import load_dataset
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 class PretrainDataset(Dataset):
     # 需要实现__len__和__getitem__

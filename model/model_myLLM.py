@@ -261,7 +261,7 @@ class MyLLMModel(nn.Module):
 class MyLLMForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MyLLMConfig
     def __init__(self, config: MyLLMConfig = None):
-        self.config = config or MiniMindConfig()
+        self.config = config or MyLLMConfig()
         super().__init__(self.config)
         self.model = MyLLMModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)

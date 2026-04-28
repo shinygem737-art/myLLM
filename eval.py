@@ -48,6 +48,8 @@ def main():
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    ## 
+    parser.add_argument('--eval_ppl', default=False, action='store_true', help="评估困惑度（使用内置测试句子）")
     args = parser.parse_args()
     
     prompts = [
@@ -67,6 +69,20 @@ def main():
     # 流式输出器，实时打印生成的token，并跳过prompt和特殊token
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
+    #   -----------测试ppl--------------------
+    if args.eval_ppl:
+    # 默认使用 prompts 作为测试集
+        test_texts = prompts
+        ppl = compute_perplexity(model, tokenizer, test_texts)
+        print(f"Perplexity: {ppl:.4f}")
+        ppl1 = compute_perplexity(model, tokenizer, ["今天天气很好"])
+        ppl2 = compute_perplexity(model, tokenizer, ["量子力学非常复杂"])
+        ppl3 = compute_perplexity(model, tokenizer, ["测试"])
+        ppl4 = compute_perplexity(model, tokenizer, ["你是谁？"])
+        print(ppl1, ppl2, ppl3, ppl4)
+    #   --------------------------------------
+
+
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
         setup_seed(random.randint(0, 31415926))
@@ -101,6 +117,78 @@ def main():
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         # 速度显示
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
+
+
+
+
+def compute_perplexity(model, tokenizer, texts, stride=None, max_length=None, device=None):
+    """
+    计算因果语言模型在给定文本上的困惑度（Perplexity）。
+    
+    参数:
+        model: MyLLMForCausalLM 实例（已加载权重，自动切换为 eval 模式）
+        tokenizer: 对应分词器
+        texts: str 或 List[str]，待评估的文本
+        stride: 滑动窗口步长，默认为 max_length // 2
+        max_length: 单次前向的最大 token 数，默认从 model.config.max_position_embeddings 读取
+        device: 设备，默认使用 model 所在设备
+    
+    返回:
+        float: 困惑度
+    """
+    import torch
+    import torch.nn.functional as F
+    from tqdm import tqdm
+
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+    
+    # 获取模型最大长度
+    if max_length is None:
+        # 根据你的 MyLLMConfig 属性名调整（可能是 max_seq_len）
+        max_length = getattr(model.config, 'max_position_embeddings', 
+                             getattr(model.config, 'max_seq_len', 512))
+    if stride is None:
+        stride = max_length // 2
+    
+    if isinstance(texts, str):
+        texts = [texts]
+    
+    total_nll = 0.0      # 累积负对数似然（总损失）
+    total_tokens = 0     # 累积有效 token 数量
+    
+    for text in tqdm(texts, desc="Computing Perplexity"):
+        encodings = tokenizer(text, return_tensors="pt", truncation=False)
+        input_ids = encodings.input_ids.to(device)
+        seq_len = input_ids.size(1)
+
+        for start in range(0, seq_len, stride):
+            end = min(start + max_length, seq_len)
+            input_window = input_ids[:, start:end]          # (1, L)
+
+            # 正确构造标签：与输入对齐，模型内部会自动右移
+            labels = input_window.clone()
+            # 可选：最后一个位置标记为忽略（模型内部用不到，但无害）
+            labels[:, -1] = -100
+
+            with torch.no_grad():
+                outputs = model(input_window, labels=labels, use_cache=False)
+                loss = outputs.loss
+
+            # 统计有效 token 数（标签非 -100 且被模型实际使用的部分）
+            # 模型内部使用了 labels[:, 1:]，因此有效 token 数 = L-1
+            num_valid = input_window.size(1) - 1
+            if num_valid > 0:
+                total_nll += loss.item() * num_valid
+                total_tokens += num_valid
+    
+    if total_tokens == 0:
+        return float('inf')
+    
+    avg_nll = total_nll / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_nll)).item()
+    return perplexity
 
 if __name__ == "__main__":
     main()

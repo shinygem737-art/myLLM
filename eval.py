@@ -71,15 +71,21 @@ def main():
     
     #   -----------测试ppl--------------------
     if args.eval_ppl:
-    # 默认使用 prompts 作为测试集
-        test_texts = prompts
-        ppl = compute_perplexity(model, tokenizer, test_texts)
-        print(f"Perplexity: {ppl:.4f}")
-        ppl1 = compute_perplexity(model, tokenizer, ["今天天气很好"])
-        ppl2 = compute_perplexity(model, tokenizer, ["量子力学非常复杂"])
-        ppl3 = compute_perplexity(model, tokenizer, ["测试"])
-        ppl4 = compute_perplexity(model, tokenizer, ["你是谁？"])
-        print(ppl1, ppl2, ppl3, ppl4)
+        # 用独立的变量，避免覆盖全局 prompts
+        ppl_test_prompts = ['量子力学好难', '你是谁', '今天天气真好', '解释什么是机器学习']
+        test_texts = []
+        for prompt in ppl_test_prompts:
+            conversation = [{"role": "user", "content": prompt}]
+            # 这里只构造 user 部分，不加 assistant 生成（因为我们要评估模型对 user 输入的似然）
+            # 如果想让模型也评估自己的回答，需要提供完整对话
+            formatted = tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=False   # 只评估已有文本
+            )
+            test_texts.append(formatted)
+            ppl = compute_perplexity(model, tokenizer, [formatted])
+            print(f"Prompt: {prompt}  |  Perplexity: {ppl:.4f}")
     #   --------------------------------------
 
 
@@ -122,73 +128,64 @@ def main():
 
 
 def compute_perplexity(model, tokenizer, texts, stride=None, max_length=None, device=None):
-    """
-    计算因果语言模型在给定文本上的困惑度（Perplexity）。
-    
-    参数:
-        model: MyLLMForCausalLM 实例（已加载权重，自动切换为 eval 模式）
-        tokenizer: 对应分词器
-        texts: str 或 List[str]，待评估的文本
-        stride: 滑动窗口步长，默认为 max_length // 2
-        max_length: 单次前向的最大 token 数，默认从 model.config.max_position_embeddings 读取
-        device: 设备，默认使用 model 所在设备
-    
-    返回:
-        float: 困惑度
-    """
     import torch
-    import torch.nn.functional as F
     from tqdm import tqdm
 
     model.eval()
     if device is None:
         device = next(model.parameters()).device
-    
-    # 获取模型最大长度
+
     if max_length is None:
-        # 根据你的 MyLLMConfig 属性名调整（可能是 max_seq_len）
-        max_length = getattr(model.config, 'max_position_embeddings', 
+        max_length = getattr(model.config, 'max_position_embeddings',
                              getattr(model.config, 'max_seq_len', 512))
     if stride is None:
         stride = max_length // 2
-    
+
     if isinstance(texts, str):
         texts = [texts]
-    
-    total_nll = 0.0      # 累积负对数似然（总损失）
-    total_tokens = 0     # 累积有效 token 数量
-    
+
+    total_nll = 0.0
+    total_tokens = 0
+
     for text in tqdm(texts, desc="Computing Perplexity"):
         encodings = tokenizer(text, return_tensors="pt", truncation=False)
         input_ids = encodings.input_ids.to(device)
         seq_len = input_ids.size(1)
 
-        for start in range(0, seq_len, stride):
+        # 第一个窗口从 0 开始
+        start = 0
+        while start < seq_len:
             end = min(start + max_length, seq_len)
             input_window = input_ids[:, start:end]          # (1, L)
-
-            # 正确构造标签：与输入对齐，模型内部会自动右移
             labels = input_window.clone()
-            # 可选：最后一个位置标记为忽略（模型内部用不到，但无害）
-            labels[:, -1] = -100
 
+            # 只让窗口的“最后 stride 个 token”参与损失计算（第一个窗口全算）
+            # 第一个窗口：允许所有位置计算（即不额外屏蔽）
+            if start != 0:
+                # 屏蔽掉前面的重叠部分，只保留最后 stride 个 token 的 label
+                labels[:, :-stride] = -100
+
+            # 注意：不要手动屏蔽最后一个 token！模型内部 shift 已处理
             with torch.no_grad():
                 outputs = model(input_window, labels=labels, use_cache=False)
-                loss = outputs.loss
+                loss = outputs.loss   # 这已经是只对 labels 中非 -100 位置的平均损失
 
-            # 统计有效 token 数（标签非 -100 且被模型实际使用的部分）
-            # 模型内部使用了 labels[:, 1:]，因此有效 token 数 = L-1
-            num_valid = input_window.size(1) - 1
+            # 统计当前窗口实际参与计算的有效 token 数（等于 labels 中非 -100 的数量）
+            num_valid = (labels[:, 1:] != -100).sum().item()
+            # 对于最后一个窗口，如果 end == seq_len，有效 token 数可能需要调整？
+            # 模型内部 shift 会忽略 labels 的第一个有效 token（因为 logits 少一位），
+            # 但 CrossEntropyLoss 已经自动处理了 -100，所以直接按 labels 的非 -100 计数即可。
             if num_valid > 0:
                 total_nll += loss.item() * num_valid
                 total_tokens += num_valid
-    
+
+            start += stride
+
     if total_tokens == 0:
         return float('inf')
-    
+
     avg_nll = total_nll / total_tokens
-    perplexity = torch.exp(torch.tensor(avg_nll)).item()
-    return perplexity
+    return torch.exp(torch.tensor(avg_nll)).item()
 
 if __name__ == "__main__":
     main()

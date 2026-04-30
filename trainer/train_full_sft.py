@@ -40,11 +40,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            # 梯度裁剪，将梯度范数限制在args.grad_clip以内
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
 
+            # 设成None比设成0节省内存
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
@@ -119,7 +121,7 @@ if __name__ == "__main__":
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast('cuda', dtype=dtype)
     
     # ========== 4. 配wandb ==========
     wandb = None
@@ -127,7 +129,7 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"MyLLM-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========

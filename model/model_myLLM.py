@@ -234,7 +234,7 @@ class MOEFeedForward(nn.Module):
             # # 辅助损失
             # self.aux_loss = (f * P).sum() * E * self.config.router_aux_loss_coef
         else:
-            self.aux_loss = scores.new_zeros(1).squeeze
+            self.aux_loss = scores.new_zeros(1).squeeze()
         
         return y.view(batch_size, seq_len, hidden_dim)
     

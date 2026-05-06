@@ -65,14 +65,20 @@ def main():
     
     conversation = []       # 存储多轮对话的历史记录
     model, tokenizer = init_model(args)
-    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     # 流式输出器，实时打印生成的token，并跳过prompt和特殊token
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     #   -----------测试ppl--------------------
     if args.eval_ppl:
         # 用独立的变量，避免覆盖全局 prompts
-        ppl_test_prompts = ['量子力学好难', '你是谁', '今天天气真好', '解释什么是机器学习']
+        ppl_test_prompts = [ '为什么天空是蓝色的',
+        '请用Python写一个计算斐波那契数列的函数',
+        '解释一下"光合作用"的基本过程',
+        '如果明天下雨，我应该如何出门',
+        '比较一下猫和狗作为宠物的优缺点',
+        '解释什么是机器学习',
+        '推荐一些中国的美食'
+    ]
         test_texts = []
         for prompt in ppl_test_prompts:
             conversation = [{"role": "user", "content": prompt}]
@@ -86,9 +92,11 @@ def main():
             test_texts.append(formatted)
             ppl = compute_perplexity(model, tokenizer, [formatted])
             print(f"Prompt: {prompt}  |  Perplexity: {ppl:.4f}")
+        return
     #   --------------------------------------
 
 
+    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
         setup_seed(random.randint(0, 31415926))
@@ -128,64 +136,119 @@ def main():
 
 
 def compute_perplexity(model, tokenizer, texts, stride=None, max_length=None, device=None):
+    """
+    计算一个语言模型在给定文本上的困惑度（Perplexity）。
+    
+    参数说明：
+        model: HuggingFace 格式的语言模型（如 GPT, Llama 等），应具有 logits 输出。
+        tokenizer: 对应的分词器，用于将文本转为 token ids。
+        texts: 字符串或字符串列表，需要评估的原始文本。
+        stride: 滑动窗口的步长。如果为 None，则设为 max_length//2。
+        max_length: 模型一次能处理的最大 token 长度。若为 None，则从 model.config 读取。
+        device: 计算设备，若为 None 则自动从模型参数中获取。
+    
+    返回：
+        float: 困惑度值，如果所有文本长度均不足2则返回无穷大。
+    """
     import torch
-    from tqdm import tqdm
+    import torch.nn.functional as F
+    #from tqdm import tqdm
 
-    model.eval()
+    model.eval()  # 切换为评估模式（关闭 dropout 等）
+
+    # 确定计算设备
     if device is None:
         device = next(model.parameters()).device
 
+    # 确定最大上下文长度（模型支持的最大 token 数）
     if max_length is None:
+        # 尝试从常见配置字段中获取
         max_length = getattr(model.config, 'max_position_embeddings',
                              getattr(model.config, 'max_seq_len', 512))
+    if max_length < 2:
+        raise ValueError("max_length 必须 >= 2，否则无法计算 next-token loss。")
+
+    # 设置滑动步长，默认取 max_length 的一半，保证相邻窗口有重叠
     if stride is None:
         stride = max_length // 2
+    # 确保步长至少为1，且不超过 max_length-1（避免窗口无法滑动）
+    stride = max(1, min(stride, max_length - 1))
 
+    # 统一将输入转换为列表形式
     if isinstance(texts, str):
         texts = [texts]
 
-    total_nll = 0.0
-    total_tokens = 0
+    total_nll = 0.0   # 累积所有有效的负对数似然之和（自然对数形式）
+    total_tokens = 0  # 累积所有参与损失计算的 token 总数
 
-    for text in tqdm(texts, desc="Computing Perplexity"):
+    # 逐条文本处理，使用 tqdm 显示进度
+    #for text in tqdm(texts, desc="Computing Perplexity"):
+    for text in texts:
+        # 将文本编码为 token ids，不做截断，保留完整序列
         encodings = tokenizer(text, return_tensors="pt", truncation=False)
-        input_ids = encodings.input_ids.to(device)
+        input_ids = encodings.input_ids.to(device)   # shape: (1, seq_len)
         seq_len = input_ids.size(1)
 
-        # 第一个窗口从 0 开始
-        start = 0
-        while start < seq_len:
+        # 如果序列长度小于2，无法预测下一个 token（没有足够的位置），跳过该文本
+        if seq_len < 2:
+            continue
+
+        start = 0  # 当前窗口的起始位置（包含）
+        while start < seq_len - 1:  # 确保窗口至少包含一个预测位置（最后一个 token 作为 label）
+            # 窗口的结束位置（不包含），不超过序列长度
             end = min(start + max_length, seq_len)
-            input_window = input_ids[:, start:end]          # (1, L)
+            input_window = input_ids[:, start:end]   # shape: (1, L)
+
+            # 创建 labels：模型需要预测每个位置的下一个 token
             labels = input_window.clone()
 
-            # 只让窗口的“最后 stride 个 token”参与损失计算（第一个窗口全算）
-            # 第一个窗口：允许所有位置计算（即不额外屏蔽）
+            # 对于非起始窗口（即 start != 0），窗口前半部分与上一个窗口重叠。
+            # 这些重叠 token 的损失已经在前一个窗口计算过了，所以忽略它们。
+            # 只保留本窗口新增加的 token（即右侧末尾的 stride 个 token）参与损失。
             if start != 0:
-                # 屏蔽掉前面的重叠部分，只保留最后 stride 个 token 的 label
-                labels[:, :-stride] = -100
+                overlap = max(0, input_window.size(1) - stride)  # 重叠部分的长度
+                if overlap > 0:
+                    # 将重叠位置的 label 设为 -100，CrossEntropyLoss 将自动忽略它们
+                    labels[:, :overlap] = -100
 
-            # 注意：不要手动屏蔽最后一个 token！模型内部 shift 已处理
+            # 模型前向推理，不计算梯度（节省内存）
             with torch.no_grad():
-                outputs = model(input_window, labels=labels, use_cache=False)
-                loss = outputs.loss   # 这已经是只对 labels 中非 -100 位置的平均损失
+                outputs = model(input_window, use_cache=False)
+                # logits shape: (1, L, vocab_size)
+                # 预测下一个 token 的 logits：取前 L-1 个位置（因为最后一个位置没有“下一个 token”）
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                # 对应的 labels：取后 L-1 个位置
+                shift_labels = labels[..., 1:].contiguous()
 
-            # 统计当前窗口实际参与计算的有效 token 数（等于 labels 中非 -100 的数量）
-            num_valid = (labels[:, 1:] != -100).sum().item()
-            # 对于最后一个窗口，如果 end == seq_len，有效 token 数可能需要调整？
-            # 模型内部 shift 会忽略 labels 的第一个有效 token（因为 logits 少一位），
-            # 但 CrossEntropyLoss 已经自动处理了 -100，所以直接按 labels 的非 -100 计数即可。
+                # 计算每个位置的交叉熵损失（不对损失取平均，保留逐一损失值）
+                token_losses = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),  # 展平为 (N, vocab_size)
+                    shift_labels.view(-1),                         # 展平为 (N,)
+                    ignore_index=-100,                             # 忽略标记为 -100 的位置
+                    reduction='none'                               # 返回每个 token 的损失
+                )
+                # 有效 token 数量（labels 中不为 -100 的位置）
+                valid_mask = shift_labels.view(-1) != -100
+                num_valid = valid_mask.sum().item()
+                # 求和得到该窗口的总负对数似然（自然对数形式，因为 CrossEntropyLoss 默认用自然对数）
+                window_nll = token_losses[valid_mask].sum().item() if num_valid > 0 else 0.0
+
             if num_valid > 0:
-                total_nll += loss.item() * num_valid
+                total_nll += window_nll
                 total_tokens += num_valid
 
+            # 滑动窗口，步长为 stride
             start += stride
 
+    # 如果没有计算到任何有效 token，返回无穷大（表示模型不能计算困惑度）
     if total_tokens == 0:
         return float('inf')
 
+    # 平均负对数似然（自然对数）
     avg_nll = total_nll / total_tokens
+    # 困惑度 = exp(平均负对数似然)
     return torch.exp(torch.tensor(avg_nll)).item()
+
 
 if __name__ == "__main__":
     main()
